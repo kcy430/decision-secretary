@@ -18,6 +18,7 @@
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 from datetime import datetime, timedelta
 import google.generativeai as genai
 from googleapiclient.discovery import build
@@ -469,8 +470,7 @@ with st.sidebar:
                             index=["組員","隊長"].index(st.session_state.my_role))
         st.session_state.my_role = role
     with c2:
-        size = st.number_input("隊伍人數", 1, 10, int(st.session_state.team_size))
-        st.session_state.team_size = size
+        st.number_input("隊伍人數", min_value=1, max_value=10, key="team_size")
 
     domains = st.multiselect(
         "我負責的技術領域",
@@ -590,18 +590,59 @@ with col_cal:
         </div>'''
 
     cal_html += "</div>"
-    st.markdown(cal_html, unsafe_allow_html=True)
 
-    # 圖例
-    st.markdown("""
-    <div style="margin-top:10px; font-size:0.78em; opacity:0.65; display:flex; gap:16px; flex-wrap:wrap;">
+    # 取出 CSS 變數對應的實際顏色（components.html 是 iframe，無法繼承父頁面 CSS 變數）
+    full_html = """
+    <style>
+    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    body { margin: 0; padding: 0; background: transparent; }
+    .cal-grid {
+        display: grid;
+        grid-template-columns: repeat(7, 1fr);
+        gap: 8px;
+        margin-top: 6px;
+    }
+    .day-cell {
+        border: 1px solid rgba(128,128,128,0.25);
+        border-radius: 10px;
+        min-height: 110px;
+        padding: 8px;
+        display: flex;
+        flex-direction: column;
+    }
+    .day-cell.today    { border: 2px solid #4dabf7; }
+    .day-cell.cog-lock { border: 2px solid #ff6b6b !important; background: rgba(255,107,107,0.05); }
+    .day-cell.hw-wait  { border: 2px dashed #ffa94d !important; background: rgba(255,169,77,0.05); }
+    .day-num  { font-size: 0.85em; font-weight: 600; margin-bottom: 3px; color: #333; }
+    .day-sub  { font-size: 0.62em; font-weight: 700; letter-spacing: 0.04em; margin-bottom: 4px; }
+    .sub-lock { color: #ff6b6b; }
+    .sub-wait { color: #ffa94d; }
+    .task-tag {
+        font-size: 0.72em;
+        padding: 2px 6px;
+        border-radius: 5px;
+        margin-bottom: 3px;
+        display: block;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .tag-h    { background: rgba(255,107,107,0.15); color: #c92a2a; }
+    .tag-l    { background: rgba(81,207,102,0.15);  color: #2b8a3e; }
+    .tag-w    { background: rgba(255,169,77,0.15);  color: #e67700; }
+    .tag-mine { border-left: 3px solid #4dabf7; padding-left: 4px; }
+    .legend   { margin-top: 8px; font-size: 0.72em; opacity: 0.65; display: flex; gap: 14px; flex-wrap: wrap; }
+    </style>
+    """ + cal_html + """
+    <div class="legend">
         <span style="color:#c92a2a">■ 高負載</span>
         <span style="color:#2b8a3e">■ 低負載</span>
         <span style="color:#e67700">■ 備料等待</span>
         <span style="border-left:3px solid #4dabf7; padding-left:4px;">藍邊 = 我的任務</span>
         <span style="color:#ff6b6b">🔒 = 認知鎖定日</span>
     </div>
-    """, unsafe_allow_html=True)
+    """
+    components.html(full_html, height=580, scrolling=False)
 
 # ── 聊天 ──────────────────────────────────────────────────────
 with col_chat:
