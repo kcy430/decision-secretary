@@ -593,8 +593,8 @@ with st.sidebar:
     st.divider()
 
     st.header("⏳ 進度防呆")
-    days_passed = st.slider("快轉天數（測試用）", 0, 14, int(st.session_state.days_passed))
-    st.session_state.days_passed = days_passed
+    st.slider("快轉天數（測試用）", 0, 14, key="days_passed")
+    days_passed = st.session_state.days_passed
 
     if days_passed >= 7 and not st.session_state.weekly_checked:
         st.error("🚨 **系統強制鎖死**\n超過 7 天未更新進度，已暫停所有功能。")
@@ -617,19 +617,22 @@ with col_cal:
     yr = st.session_state.cal_year
     mo = st.session_state.cal_month
 
-    hdr_col, prev_col, next_col = st.columns([5, 1, 1])
-    with hdr_col:
-        st.markdown(f"### 🗓️ {yr} 年 {mo} 月")
-    with prev_col:
-        if st.button("◀ 上月"):
+    nav_l, nav_title, nav_r = st.columns([1, 4, 1])
+    with nav_l:
+        if st.button("◀", use_container_width=True, help="上個月"):
             if mo == 1:
                 st.session_state.cal_year  -= 1
                 st.session_state.cal_month  = 12
             else:
                 st.session_state.cal_month -= 1
             st.rerun()
-    with next_col:
-        if st.button("下月 ▶"):
+    with nav_title:
+        st.markdown(
+            f"<h3 style='text-align:center;margin:0;padding:4px 0'>🗓️ {yr} 年 {mo} 月</h3>",
+            unsafe_allow_html=True,
+        )
+    with nav_r:
+        if st.button("▶", use_container_width=True, help="下個月"):
             if mo == 12:
                 st.session_state.cal_year  += 1
                 st.session_state.cal_month  = 1
@@ -657,7 +660,7 @@ with col_chat:
         type=["pdf", "png", "jpg", "jpeg"]
     )
 
-    chat_box = st.container(height=520)
+    chat_box = st.container(height=380)
     with chat_box:
         for msg in st.session_state.messages:
             with st.chat_message(msg["role"]):
