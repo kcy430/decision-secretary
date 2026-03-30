@@ -221,12 +221,12 @@ body { background: #1e1e1e; color: #e0e0e0; }
     background: #2a2a2a;
     border: 1px solid #363636;
     border-radius: 8px;
-    min-height: 88px;
-    padding: 6px;
+    min-height: 72px;
+    padding: 5px;
     display: flex;
     flex-direction: column;
 }
-.day-cell.empty   { background: transparent; border: none; min-height: 88px; }
+.day-cell.empty   { background: transparent; border: none; min-height: 72px; }
 .day-cell.today   { border: 1.5px solid #4dabf7; }
 .day-cell.weekend { background: #252525; }
 .day-cell.cog-lock { border: 1.5px solid #ff6b6b; background: #2e2020; }
@@ -640,7 +640,7 @@ with col_cal:
     num_days  = cal_lib.monthrange(yr, mo)[1]
     first_wd  = datetime(yr, mo, 1).weekday()
     num_rows  = math.ceil((first_wd + num_days) / 7)
-    cal_height = num_rows * 102 + 75
+    cal_height = num_rows * 82 + 100   # 每列 82px + 週標題與圖例緩衝
 
     components.html(
         render_month_html(st.session_state.schedule, yr, mo),
