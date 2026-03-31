@@ -1,38 +1,36 @@
 """
-決策小秘書 V4.5
+決策小秘書 V4.6
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 部署（Streamlit Community Cloud）：
   1. Push 整個資料夾（含 .streamlit/config.toml）到 GitHub
   2. share.streamlit.io 連接 repo，主檔選 app.py
   3. App settings → Secrets 加入：
        GEMINI_API_KEY = "AIza..."
-  4. （選用）Google Calendar：
-       [google_service_account]
-       type = "service_account"
-       ... （完整 service-account.json 內容）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import streamlit as st
 import streamlit.components.v1 as components
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import calendar as cal_lib
 import google.generativeai as genai
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials as SACredentials
-import json, tempfile, os, math
+import json, tempfile, os, math, uuid
 
 # ══════════════════════════════════════════════════════════════
 #  PAGE CONFIG
 # ══════════════════════════════════════════════════════════════
-st.set_page_config(layout="wide", page_title="決策小秘書 V4.5", page_icon="🗓️")
+st.set_page_config(layout="wide", page_title="決策小秘書 V4.6", page_icon="🗓️")
 
 st.markdown("""
 <style>
     section[data-testid="stSidebar"] { background-color: #252525; }
     .block-container { padding-top: 3.5rem !important; padding-bottom: 1rem; }
-    [data-testid="stAppViewContainer"] { background-color: #1e1e1e; }
     header[data-testid="stHeader"] { background-color: #1e1e1e; }
+    [data-testid="stAppViewContainer"] { background-color: #1e1e1e; }
+    /* 讓 dialog 背景深色 */
+    [data-testid="stModal"] > div { background-color: #2a2a2a !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -42,6 +40,8 @@ st.markdown("""
 DAILY_CAP      = 4
 COG_LOCK_AFTER = 3
 GCAL_SCOPES    = ["https://www.googleapis.com/auth/calendar.events"]
+LOAD_OPTIONS   = {"🔴 高負載": "high", "🟢 低負載": "low"}
+LOAD_DISPLAY   = {v: k for k, v in LOAD_OPTIONS.items()}
 
 RAG_DB = {
     "機構設計與3D列印": {
@@ -80,37 +80,18 @@ RAG_DB = {
         "roles": ["隊長", "所有人"],
     },
 }
-
 TECH_TAGS = list(RAG_DB.keys())
 
 # ══════════════════════════════════════════════════════════════
 #  SESSION STATE INIT
 # ══════════════════════════════════════════════════════════════
-def _blank_schedule() -> dict:
-    """排程改用 {date_str: day_data} 字典，支援無限跨月。"""
-    s: dict = {}
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    count = 0
-    d = today
-    while count < 5:
-        if d.weekday() < 5:
-            ds = d.strftime("%Y-%m-%d")
-            s[ds] = {
-                "tasks":      [{"name": "既有專題", "load": "high", "mine": True}] * 3,
-                "hw_wait":    None,
-                "cog_locked": False,
-            }
-            count += 1
-        d += timedelta(days=1)
-    return s
-
 def _init():
     today = datetime.now()
     defaults = {
         "messages": [{"role": "assistant", "content":
-            "你好！請先在左側確認 **Gemini API Key** 已連線，並設定你的**參賽角色**，"
-            "然後把比賽簡章丟進來讓我評估。"}],
-        "schedule":       _blank_schedule(),
+            "你好！請在左側設定你的**參賽角色**，然後把比賽簡章丟進來讓我評估。\n\n"
+            "點擊行事曆上的任意日期格子可以新增或編輯任務。"}],
+        "schedule":       {},          # {date_str: {"tasks": [...], "hw_wait": None, "cog_locked": False}}
         "my_role":        "組員",
         "my_domains":     [],
         "team_size":      4,
@@ -120,6 +101,7 @@ def _init():
         "days_passed":    0,
         "cal_year":       today.year,
         "cal_month":      today.month,
+        "edit_date":      None,        # 目前正在編輯的日期字串
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -128,7 +110,28 @@ def _init():
 _init()
 
 # ══════════════════════════════════════════════════════════════
-#  HELPERS — 認知負載
+#  TASK HELPERS
+# ══════════════════════════════════════════════════════════════
+def get_day(date_str: str) -> dict:
+    """取得或建立某天的資料結構。"""
+    if date_str not in st.session_state.schedule:
+        st.session_state.schedule[date_str] = {
+            "tasks": [], "hw_wait": None, "cog_locked": False
+        }
+    return st.session_state.schedule[date_str]
+
+def blank_task() -> dict:
+    return {
+        "id":       str(uuid.uuid4())[:8],
+        "name":     "",
+        "load":     "high",
+        "mine":     True,
+        "deadline": None,   # date string YYYY-MM-DD or None
+        "notes":    "",
+    }
+
+# ══════════════════════════════════════════════════════════════
+#  COGNITIVE LOAD
 # ══════════════════════════════════════════════════════════════
 def _day_dominant_load(tasks: list) -> str:
     if not tasks:
@@ -144,15 +147,17 @@ def recompute_cog_locks(schedule: dict) -> dict:
         if i < COG_LOCK_AFTER:
             schedule[ds]["cog_locked"] = False
             continue
-        prev = []
-        for j in range(COG_LOCK_AFTER):
-            pd = (today + timedelta(days=i - j - 1)).strftime("%Y-%m-%d")
-            prev.append(_day_dominant_load(schedule.get(pd, {}).get("tasks", [])))
+        prev = [
+            _day_dominant_load(
+                schedule.get((today + timedelta(days=i - j - 1)).strftime("%Y-%m-%d"), {}).get("tasks", [])
+            )
+            for j in range(COG_LOCK_AFTER)
+        ]
         schedule[ds]["cog_locked"] = all(l == "high" for l in prev)
     return schedule
 
 # ══════════════════════════════════════════════════════════════
-#  HELPERS — 角色過濾
+#  ROLE FILTER
 # ══════════════════════════════════════════════════════════════
 def filter_my_tasks(all_techs: list, my_role: str, my_domains: list) -> list:
     mine = []
@@ -170,7 +175,55 @@ def filter_my_tasks(all_techs: list, my_role: str, my_domains: list) -> list:
     return mine
 
 # ══════════════════════════════════════════════════════════════
-#  GOOGLE CALENDAR
+#  ICS EXPORT（Apple / Samsung / Outlook 通用）
+# ══════════════════════════════════════════════════════════════
+def generate_ics(schedule: dict) -> str:
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//決策小秘書 V4.6//ZH",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "X-WR-CALNAME:決策小秘書",
+        "X-WR-TIMEZONE:Asia/Taipei",
+    ]
+    now_stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+    for date_str, day in schedule.items():
+        tasks = day.get("tasks", [])
+        if not tasks:
+            continue
+        # 每天合併成一個全天事件
+        names   = list({t["name"] for t in tasks})
+        notes   = "; ".join(t["notes"] for t in tasks if t.get("notes"))
+        dl_list = [t["deadline"] for t in tasks if t.get("deadline")]
+        dl_str  = "截止日: " + ", ".join(dl_list) if dl_list else ""
+
+        dt_start = date_str.replace("-", "")
+        # DTEND for all-day = next day
+        dt_obj   = datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)
+        dt_end   = dt_obj.strftime("%Y%m%d")
+        summary  = "🗓️ " + " | ".join(names)
+        desc_parts = [p for p in [notes, dl_str] if p]
+        desc     = "\\n".join(desc_parts) if desc_parts else "決策小秘書自動排入"
+
+        uid = f"{date_str}-secretary@v46"
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:{uid}",
+            f"DTSTAMP:{now_stamp}",
+            f"DTSTART;VALUE=DATE:{dt_start}",
+            f"DTEND;VALUE=DATE:{dt_end}",
+            f"SUMMARY:{summary}",
+            f"DESCRIPTION:{desc}",
+            "END:VEVENT",
+        ]
+
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines)
+
+# ══════════════════════════════════════════════════════════════
+#  GOOGLE CALENDAR（保留架構供未來擴展）
 # ══════════════════════════════════════════════════════════════
 def build_gcal_service(sa_info: dict):
     creds = SACredentials.from_service_account_info(sa_info, scopes=GCAL_SCOPES)
@@ -181,7 +234,7 @@ def write_to_gcal(service, tasks_by_date: dict, calendar_id: str = "primary") ->
     for date_str, names in tasks_by_date.items():
         event = {
             "summary":     "🗓️ " + " | ".join(set(names)),
-            "description": "由決策小秘書 V4.5 自動排入",
+            "description": "由決策小秘書 V4.6 自動排入",
             "start": {"date": date_str},
             "end":   {"date": date_str},
         }
@@ -193,31 +246,132 @@ def write_to_gcal(service, tasks_by_date: dict, calendar_id: str = "primary") ->
     return results
 
 # ══════════════════════════════════════════════════════════════
-#  CALENDAR RENDERER（月曆格式，深色主題）
+#  EDIT DAY DIALOG
+# ══════════════════════════════════════════════════════════════
+@st.dialog("📅 編輯任務", width="large")
+def edit_day_dialog(date_str: str):
+    day  = get_day(date_str)
+    dt   = datetime.strptime(date_str, "%Y-%m-%d")
+    wd   = ["一","二","三","四","五","六","日"][dt.weekday()]
+    st.markdown(f"#### {dt.strftime('%Y / %m / %d')} 週{wd}")
+
+    if day["cog_locked"]:
+        st.warning("🔒 這天已被認知負載系統鎖定，高負載名額已滿。仍可新增低負載任務。")
+
+    tasks = day["tasks"]
+
+    # ── 既有任務列表 ────────────────────────────────────────
+    to_delete = []
+    for i, task in enumerate(tasks):
+        with st.container(border=True):
+            c1, c2, c3 = st.columns([4, 2, 1])
+            with c1:
+                new_name = st.text_input(
+                    "任務名稱", value=task["name"],
+                    key=f"tname_{date_str}_{i}",
+                    placeholder="輸入任務名稱"
+                )
+                task["name"] = new_name
+            with c2:
+                load_label = st.selectbox(
+                    "負載類型",
+                    list(LOAD_OPTIONS.keys()),
+                    index=list(LOAD_OPTIONS.values()).index(task["load"]),
+                    key=f"tload_{date_str}_{i}",
+                )
+                task["load"] = LOAD_OPTIONS[load_label]
+            with c3:
+                st.write("")
+                st.write("")
+                if st.button("🗑️", key=f"tdel_{date_str}_{i}", help="刪除此任務"):
+                    to_delete.append(i)
+
+            c4, c5 = st.columns([2, 3])
+            with c4:
+                dl_val = date.fromisoformat(task["deadline"]) if task.get("deadline") else None
+                new_dl = st.date_input(
+                    "截止日（選填）",
+                    value=dl_val,
+                    key=f"tdl_{date_str}_{i}",
+                    format="YYYY/MM/DD",
+                )
+                task["deadline"] = new_dl.isoformat() if new_dl else None
+            with c5:
+                new_notes = st.text_input(
+                    "備註（選填）", value=task.get("notes", ""),
+                    key=f"tnotes_{date_str}_{i}",
+                    placeholder="備忘、提醒、連結…"
+                )
+                task["notes"] = new_notes
+
+    # 執行刪除（反向刪避免 index shift）
+    for i in reversed(to_delete):
+        tasks.pop(i)
+
+    st.divider()
+
+    # ── 新增任務 ────────────────────────────────────────────
+    st.markdown("**＋ 新增任務**")
+    nc1, nc2 = st.columns([4, 2])
+    with nc1:
+        new_name = st.text_input("任務名稱", key=f"new_name_{date_str}", placeholder="例如：韌體架構規劃")
+    with nc2:
+        new_load_label = st.selectbox("負載類型", list(LOAD_OPTIONS.keys()), key=f"new_load_{date_str}")
+
+    nc3, nc4 = st.columns([2, 3])
+    with nc3:
+        new_dl = st.date_input("截止日（選填）", value=None, key=f"new_dl_{date_str}", format="YYYY/MM/DD")
+    with nc4:
+        new_notes = st.text_input("備註（選填）", key=f"new_notes_{date_str}", placeholder="備忘、提醒、連結…")
+
+    if st.button("＋ 加入", type="primary", use_container_width=True):
+        if new_name.strip():
+            tasks.append({
+                "id":       str(uuid.uuid4())[:8],
+                "name":     new_name.strip(),
+                "load":     LOAD_OPTIONS[new_load_label],
+                "mine":     True,
+                "deadline": new_dl.isoformat() if new_dl else None,
+                "notes":    new_notes.strip(),
+            })
+            st.success(f"已新增「{new_name.strip()}」")
+        else:
+            st.warning("請輸入任務名稱")
+
+    st.divider()
+
+    # ── 備料等待標記 ────────────────────────────────────────
+    hw_val = day.get("hw_wait") or ""
+    new_hw = st.text_input(
+        "⏳ 備料等待標記（選填）",
+        value=hw_val,
+        key=f"hw_{date_str}",
+        placeholder="例如：備料：PCB電路設計"
+    )
+    day["hw_wait"] = new_hw.strip() or None
+
+    # ── 儲存 ────────────────────────────────────────────────
+    st.write("")
+    if st.button("✅ 儲存並關閉", type="primary", use_container_width=True):
+        recompute_cog_locks(st.session_state.schedule)
+        st.session_state.edit_date = None
+        st.rerun()
+
+# ══════════════════════════════════════════════════════════════
+#  CALENDAR RENDERER
 # ══════════════════════════════════════════════════════════════
 def render_month_html(schedule: dict, year: int, month: int) -> str:
     today_date = datetime.now().date()
     num_days   = cal_lib.monthrange(year, month)[1]
-    first_wd   = datetime(year, month, 1).weekday()  # 0=Mon
+    first_wd   = datetime(year, month, 1).weekday()
 
     css = """
 <style>
 * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 0; }
 body { background: #1e1e1e; color: #e0e0e0; }
 .cal-wrap { padding: 4px 2px; }
-.cal-grid {
-    display: grid;
-    grid-template-columns: repeat(7, 1fr);
-    gap: 5px;
-}
-.day-header {
-    text-align: center;
-    font-size: 0.72em;
-    font-weight: 600;
-    color: #666;
-    padding: 4px 0 6px;
-    letter-spacing: 0.05em;
-}
+.cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px; }
+.day-header { text-align: center; font-size: 0.72em; font-weight: 600; color: #666; padding: 4px 0 6px; letter-spacing: 0.05em; }
 .day-cell {
     background: #2a2a2a;
     border: 1px solid #363636;
@@ -226,35 +380,29 @@ body { background: #1e1e1e; color: #e0e0e0; }
     padding: 5px;
     display: flex;
     flex-direction: column;
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
 }
-.day-cell.empty   { background: transparent; border: none; min-height: 72px; }
+.day-cell:hover { border-color: #4dabf7; background: #2f3640; }
+.day-cell.empty   { background: transparent; border: none; cursor: default; min-height: 72px; }
+.day-cell.empty:hover { background: transparent; border: none; }
 .day-cell.today   { border: 1.5px solid #4dabf7; }
 .day-cell.weekend { background: #252525; }
-.day-cell.cog-lock { border: 1.5px solid #ff6b6b; background: #2e2020; }
-.day-cell.hw-wait  { border: 1.5px dashed #ffa94d; background: #2c2618; }
+.day-cell.cog-lock { border: 1.5px solid #ff6b6b !important; background: #2e2020; }
+.day-cell.hw-wait  { border: 1.5px dashed #ffa94d !important; background: #2c2618; }
 .day-num { font-size: 0.78em; font-weight: 600; color: #bbb; margin-bottom: 3px; }
-.day-num.is-today { color: #4dabf7; }
-.day-num.is-weekend { color: #888; }
-.day-sub {
-    font-size: 0.60em; font-weight: 700; letter-spacing: 0.04em;
-    margin-bottom: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
+.day-num.is-today   { color: #4dabf7; }
+.day-num.is-weekend { color: #777; }
+.day-sub { font-size: 0.60em; font-weight: 700; letter-spacing: 0.04em; margin-bottom: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sub-lock { color: #ff6b6b; }
 .sub-wait { color: #ffa94d; }
-.task-tag {
-    font-size: 0.68em; padding: 1px 5px; border-radius: 4px;
-    margin-bottom: 2px; display: block;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
+.task-tag { font-size: 0.68em; padding: 1px 5px; border-radius: 4px; margin-bottom: 2px; display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tag-h    { background: rgba(255,107,107,0.18); color: #ff8787; }
 .tag-l    { background: rgba(81,207,102,0.18);  color: #69db7c; }
-.tag-w    { background: rgba(255,169,77,0.18);  color: #ffc078; }
 .tag-mine { border-left: 2px solid #4dabf7; padding-left: 4px; }
-.legend {
-    display: flex; gap: 14px; flex-wrap: wrap;
-    margin-top: 8px; padding: 0 2px;
-    font-size: 0.68em; color: #666;
-}
+.has-dl   { font-size: 0.58em; color: #aaa; margin-top: 1px; }
+.add-hint { font-size: 0.62em; color: #555; margin-top: auto; padding-top: 4px; }
+.legend   { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 8px; padding: 0 2px; font-size: 0.68em; color: #666; }
 </style>
 """
 
@@ -295,29 +443,51 @@ body { background: #1e1e1e; color: #e0e0e0; }
         for t in d.get("tasks", []):
             n = t["name"]
             if n not in shown:
-                shown[n] = {"count": 0, "load": t["load"], "mine": t.get("mine", False)}
+                shown[n] = {"count": 0, "load": t["load"], "mine": t.get("mine", False), "deadline": t.get("deadline")}
             shown[n]["count"] += 1
 
         tags_html = ""
         for name, info in shown.items():
-            lc  = "tag-h" if info["load"] == "high" else ("tag-l" if info["load"] == "low" else "tag-w")
+            lc  = "tag-h" if info["load"] == "high" else "tag-l"
             mc  = " tag-mine" if info["mine"] else ""
             lbl = name + (f" ×{info['count']}" if info["count"] > 1 else "")
-            tags_html += f'<span class="task-tag {lc}{mc}">{lbl}</span>'
+            dl_hint = f'<div class="has-dl">📅 截止 {info["deadline"]}</div>' if info.get("deadline") else ""
+            tags_html += f'<span class="task-tag {lc}{mc}">{lbl}</span>{dl_hint}'
 
-        html += f'<div class="{cell_cls}"><div class="{num_cls}">{day}</div>{sub_html}{tags_html}</div>'
+        # 點擊提示（空天才顯示）
+        add_hint = '<div class="add-hint">＋ 點擊新增</div>' if not d.get("tasks") else ""
 
-    html += "</div>"  # cal-grid
+        # onclick 傳日期給父層
+        onclick = f"window.parent.postMessage({{type:'edit_date',date:'{ds}'}}, '*')"
+        html += (
+            f'<div class="{cell_cls}" onclick="{onclick}">'
+            f'<div class="{num_cls}">{day}</div>'
+            f'{sub_html}{tags_html}{add_hint}'
+            f'</div>'
+        )
+
+    html += "</div>"
     html += """
 <div class="legend">
     <span style="color:#ff8787">■ 高負載</span>
     <span style="color:#69db7c">■ 低負載</span>
-    <span style="color:#ffc078">■ 備料等待</span>
+    <span style="color:#ffa94d">■ 備料等待</span>
     <span style="border-left:2px solid #4dabf7;padding-left:4px;color:#4dabf7;">藍邊 = 我的任務</span>
     <span style="color:#ff6b6b">🔒 認知鎖定</span>
     <span style="color:#4dabf7">● 今天</span>
+    <span style="color:#555">點擊格子可編輯</span>
 </div>
 </div>"""
+
+    # postMessage → Streamlit via query param（讓點擊格子能觸發 dialog）
+    html += """
+<script>
+window.addEventListener('message', function(e) {
+    if (e.data && e.data.type === 'edit_date') {
+        window.parent.postMessage(e.data, '*');
+    }
+});
+</script>"""
 
     return html
 
@@ -333,32 +503,20 @@ class SecretaryBrain:
             response_schema={
                 "type": "OBJECT",
                 "properties": {
-                    "tech_tags": {
-                        "type": "ARRAY", "items": {"type": "STRING"},
-                        "description": f"抽取技術標籤，只能從以下挑選：{TECH_TAGS}",
-                    },
-                    "confidence": {
-                        "type": "STRING",
-                        "description": "資訊充足填 high；技術不明或無死線填 low",
-                    },
-                    "follow_up_question": {
-                        "type": "STRING",
-                        "description": "若 confidence 為 low，提出問題詢問缺少的資訊",
-                    },
-                    "deadline_days": {
-                        "type": "INTEGER",
-                        "description": "距死線天數，未提及預設填 14",
-                    },
-                    "project_name": {
-                        "type": "STRING",
-                        "description": "專案或比賽名稱，找不到填「未命名專案」",
-                    },
+                    "tech_tags":           {"type": "ARRAY", "items": {"type": "STRING"},
+                                           "description": f"只能從以下挑選：{TECH_TAGS}"},
+                    "confidence":          {"type": "STRING",
+                                           "description": "資訊充足填 high；不明或無死線填 low"},
+                    "follow_up_question":  {"type": "STRING",
+                                           "description": "若 low，提出問題詢問缺少的資訊"},
+                    "deadline_days":       {"type": "INTEGER",
+                                           "description": "距死線天數，未提及預設 14"},
+                    "project_name":        {"type": "STRING",
+                                           "description": "專案名稱，找不到填「未命名專案」"},
                 },
-                "required": ["tech_tags", "confidence", "follow_up_question",
-                             "deadline_days", "project_name"],
+                "required": ["tech_tags","confidence","follow_up_question","deadline_days","project_name"],
             },
         )
-
         model     = genai.GenerativeModel("gemini-2.5-flash")
         parts     = [f"請分析以下專案需求或比賽簡章，抽取關鍵資訊：\n{user_input}"]
         temp_path = None
@@ -378,19 +536,14 @@ class SecretaryBrain:
             resp = model.generate_content(parts, generation_config=generation_config)
             data = json.loads(resp.text)
         except Exception as e:
-            data = {
-                "confidence": "low",
-                "follow_up_question": f"API 底層錯誤：`{e}`",
-                "tech_tags": [], "deadline_days": 14, "project_name": "未命名專案",
-            }
+            data = {"confidence": "low", "follow_up_question": f"API 錯誤：`{e}`",
+                    "tech_tags": [], "deadline_days": 14, "project_name": "未命名專案"}
         finally:
             if temp_path and os.path.exists(temp_path): os.remove(temp_path)
 
         if data.get("confidence") == "low" or not data.get("tech_tags"):
-            return {
-                "status": "needs_info",
-                "reply": f"🛑 **資訊不足，已阻斷排程。**\n\n{data.get('follow_up_question')}",
-            }
+            return {"status": "needs_info",
+                    "reply": f"🛑 **資訊不足，已阻斷排程。**\n\n{data.get('follow_up_question')}"}
         return {"status": "success", **data}
 
     @staticmethod
@@ -398,7 +551,7 @@ class SecretaryBrain:
         today    = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         deadline = min(deadline_days, 120)
 
-        sch: dict = {
+        sch = {
             ds: {"tasks": list(v["tasks"]), "hw_wait": v["hw_wait"], "cog_locked": v["cog_locked"]}
             for ds, v in current_schedule.items()
         }
@@ -416,8 +569,7 @@ class SecretaryBrain:
                     if sch[ds]["hw_wait"] is None:
                         sch[ds]["hw_wait"] = f"備料：{tech}"
                 hw_warnings.append(
-                    f"⏳ **{tech}** 需備料 {meta['lead_days']} 天，前 {lead} 天標記為等待期。"
-                )
+                    f"⏳ **{tech}** 需備料 {meta['lead_days']} 天，前 {lead} 天標記為等待期。")
 
         total_hours = sum(RAG_DB[t]["base_hours"] for t in my_techs if t in RAG_DB)
         max_diff    = max((RAG_DB[t]["diff"] for t in my_techs if t in RAG_DB), default=1)
@@ -427,7 +579,11 @@ class SecretaryBrain:
         for tech in my_techs:
             meta = RAG_DB.get(tech, {})
             w    = math.ceil(meta.get("base_hours", 4) * (1 + (meta.get("diff", 1) - 1) * 0.25))
-            task_queue.extend([{"name": tech, "load": meta.get("load", "high"), "mine": True}] * w)
+            task_queue.extend([
+                {"id": str(uuid.uuid4())[:8], "name": tech,
+                 "load": meta.get("load","high"), "mine": True,
+                 "deadline": None, "notes": ""}
+            ] * w)
 
         tasks_by_date: dict = {}
         remaining = list(task_queue)
@@ -437,16 +593,12 @@ class SecretaryBrain:
             ds = (today + timedelta(days=i)).strftime("%Y-%m-%d")
             if ds not in sch:
                 sch[ds] = {"tasks": [], "hw_wait": None, "cog_locked": False}
-
             avail = DAILY_CAP - len(sch[ds]["tasks"])
             if avail <= 0: continue
-
             placed, new_rem = 0, []
             for task in remaining:
-                if placed >= avail:
-                    new_rem.append(task); continue
-                if sch[ds]["cog_locked"] and task["load"] == "high":
-                    new_rem.append(task); continue
+                if placed >= avail: new_rem.append(task); continue
+                if sch[ds]["cog_locked"] and task["load"] == "high": new_rem.append(task); continue
                 sch[ds]["tasks"].append(task)
                 tasks_by_date.setdefault(ds, []).append(task["name"])
                 placed += 1
@@ -460,12 +612,9 @@ class SecretaryBrain:
         ]
 
         return {
-            "schedule":       sch,
-            "weighted_hours": weighted,
-            "tasks_by_date":  tasks_by_date,
-            "overflow":       bool(remaining),
-            "hw_warnings":    hw_warnings,
-            "cog_lock_dates": cog_lock_dates,
+            "schedule": sch, "weighted_hours": weighted,
+            "tasks_by_date": tasks_by_date, "overflow": bool(remaining),
+            "hw_warnings": hw_warnings, "cog_lock_dates": cog_lock_dates,
         }
 
     @staticmethod
@@ -492,35 +641,22 @@ class SecretaryBrain:
 
         for w_msg in sandbox_res["hw_warnings"]:
             lines.append(w_msg)
-
         if sandbox_res["cog_lock_dates"]:
             sample = ", ".join(sandbox_res["cog_lock_dates"][:3])
-            lines.append(
-                f"🧠 **認知負載警告**：偵測到連續高負載，"
-                f"已鎖定 {sample} 等日期的高負載名額。"
-            )
+            lines.append(f"🧠 **認知負載警告**：已鎖定 {sample} 等日期的高負載名額。")
 
         lines.append("")
         max_daily = DAILY_CAP * deadline
         load_pct  = int(w / max_daily * 100) if max_daily > 0 else 999
 
         if sandbox_res["overflow"]:
-            lines.append(
-                f"### 🔴 無法接案\n"
-                f"加權工時 **{w} 小時**，死線前物理時間已擊穿。\n"
-                f"建議：延後死線 / 縮減功能 / 增加人手。"
-            )
+            lines.append(f"### 🔴 無法接案\n加權工時 **{w} 小時**，死線前物理時間已擊穿。\n"
+                         f"建議：延後死線 / 縮減功能 / 增加人手。")
         elif load_pct >= 80:
-            lines.append(
-                f"### 🟡 勉強可接（中等風險）\n"
-                f"加權工時 **{w} 小時**，行事曆負載達 {load_pct}%，已排入。\n"
-                f"建議：本週末先完成環境架設，把風險前壓。"
-            )
+            lines.append(f"### 🟡 勉強可接（中等風險）\n加權工時 **{w} 小時**，行事曆負載達 {load_pct}%，已排入。\n"
+                         f"建議：本週末先完成環境架設，把風險前壓。")
         else:
-            lines.append(
-                f"### 🟢 適合接案\n"
-                f"加權工時 **{w} 小時**，行事曆負載 {load_pct}%，餘裕充足，已自動排入。"
-            )
+            lines.append(f"### 🟢 適合接案\n加權工時 **{w} 小時**，行事曆負載 {load_pct}%，餘裕充足，已自動排入。")
 
         return "\n".join(lines)
 
@@ -560,42 +696,25 @@ with st.sidebar:
 
     st.divider()
 
-    st.header("📅 Google Calendar")
-    if st.session_state.gcal_service is not None:
-        st.success("✅ Calendar 已連線")
-        if st.button("斷開 Calendar"):
-            st.session_state.gcal_service = None
-            st.rerun()
-    else:
-        if "google_service_account" in st.secrets:
-            try:
-                sa_info = dict(st.secrets["google_service_account"])
-                st.session_state.gcal_service = build_gcal_service(sa_info)
-                st.success("✅ Calendar 已從 Secrets 連線")
-            except Exception as e:
-                st.error(f"Secrets 連線失敗：{e}")
-
-        with st.expander("手動連線（貼上 Service Account JSON）"):
-            sa_raw = st.text_area("Service Account JSON", height=80)
-            cal_id = st.text_input("Calendar ID", value="primary")
-            if st.button("連線"):
-                try:
-                    sa_info = json.loads(sa_raw)
-                    st.session_state.gcal_service = build_gcal_service(sa_info)
-                    st.session_state.calendar_id  = cal_id
-                    st.success("連線成功！")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"連線失敗：{e}")
+    # ── ICS 匯出 ───────────────────────────────────────────
+    st.header("📤 匯出行事曆")
+    st.caption("匯出 .ics 檔案可匯入 Apple 行事曆、Samsung 行事曆、Outlook 等。")
+    ics_data = generate_ics(st.session_state.schedule)
+    st.download_button(
+        label="⬇️ 下載 ICS 檔案",
+        data=ics_data,
+        file_name="secretary_schedule.ics",
+        mime="text/calendar",
+        use_container_width=True,
+        help="下載後：iOS 直接點擊 → 加入行事曆；Android 用行事曆 app 開啟匯入",
+    )
 
     st.divider()
 
     st.header("⏳ 進度防呆")
     st.slider("快轉天數（測試用）", 0, 14, key="days_passed")
-    days_passed = st.session_state.days_passed
-
-    if days_passed >= 7 and not st.session_state.weekly_checked:
-        st.error("🚨 **系統強制鎖死**\n超過 7 天未更新進度，已暫停所有功能。")
+    if st.session_state.days_passed >= 7 and not st.session_state.weekly_checked:
+        st.error("🚨 **系統強制鎖死**\n超過 7 天未更新進度。")
         report = st.text_area("請回報本週進度以解鎖：")
         if st.button("提交解鎖"):
             if report.strip():
@@ -604,6 +723,30 @@ with st.sidebar:
             else:
                 st.warning("請輸入實際進度後再提交。")
         st.stop()
+
+# ══════════════════════════════════════════════════════════════
+#  DIALOG TRIGGER（從月曆格子點擊觸發）
+# ══════════════════════════════════════════════════════════════
+# 由於 iframe postMessage 無法直接觸發 Streamlit rerun，
+# 改用側邊欄的日期選擇器作為穩定的觸發入口
+with st.sidebar:
+    st.divider()
+    st.header("✏️ 手動選擇日期編輯")
+    selected = st.date_input(
+        "選擇要編輯的日期",
+        value=None,
+        key="sidebar_date_picker",
+        format="YYYY/MM/DD",
+        help="也可直接點月曆格子選擇",
+    )
+    if selected:
+        if st.button("開啟編輯視窗", use_container_width=True, type="primary"):
+            st.session_state.edit_date = selected.isoformat()
+            st.rerun()
+
+# 觸發 dialog
+if st.session_state.edit_date:
+    edit_day_dialog(st.session_state.edit_date)
 
 # ══════════════════════════════════════════════════════════════
 #  MAIN LAYOUT
@@ -618,11 +761,8 @@ with col_cal:
     nav_l, nav_title, nav_r = st.columns([1, 4, 1])
     with nav_l:
         if st.button("◀", use_container_width=True, help="上個月"):
-            if mo == 1:
-                st.session_state.cal_year  -= 1
-                st.session_state.cal_month  = 12
-            else:
-                st.session_state.cal_month -= 1
+            st.session_state.cal_month = 12 if mo == 1 else mo - 1
+            if mo == 1: st.session_state.cal_year -= 1
             st.rerun()
     with nav_title:
         st.markdown(
@@ -631,17 +771,14 @@ with col_cal:
         )
     with nav_r:
         if st.button("▶", use_container_width=True, help="下個月"):
-            if mo == 12:
-                st.session_state.cal_year  += 1
-                st.session_state.cal_month  = 1
-            else:
-                st.session_state.cal_month += 1
+            st.session_state.cal_month = 1 if mo == 12 else mo + 1
+            if mo == 12: st.session_state.cal_year += 1
             st.rerun()
 
-    num_days  = cal_lib.monthrange(yr, mo)[1]
-    first_wd  = datetime(yr, mo, 1).weekday()
-    num_rows  = math.ceil((first_wd + num_days) / 7)
-    cal_height = num_rows * 82 + 100   # 每列 82px + 週標題與圖例緩衝
+    num_days   = cal_lib.monthrange(yr, mo)[1]
+    first_wd   = datetime(yr, mo, 1).weekday()
+    num_rows   = math.ceil((first_wd + num_days) / 7)
+    cal_height = num_rows * 82 + 100
 
     components.html(
         render_month_html(st.session_state.schedule, yr, mo),
@@ -668,7 +805,7 @@ with col_chat:
 
     if prompt := st.chat_input("輸入指令，例如：幫我評估這個比賽簡章"):
         if not api_key:
-            st.error("API Key 未設定，請檢查 Streamlit Cloud Secrets。")
+            st.error("API Key 未設定。")
             st.stop()
 
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -690,11 +827,9 @@ with col_chat:
                         st.session_state.my_role,
                         st.session_state.my_domains,
                     )
-                    deadline = parsed["deadline_days"]
-
                     with st.spinner("⚙️ 沙盒模擬排程中..."):
                         sim = SecretaryBrain.sandbox(
-                            my_techs, st.session_state.schedule, deadline
+                            my_techs, st.session_state.schedule, parsed["deadline_days"]
                         )
 
                     reply = SecretaryBrain.loop_2_strategy(parsed, my_techs, sim)
@@ -703,16 +838,7 @@ with col_chat:
                     if not sim["overflow"] and my_techs:
                         st.session_state.schedule = sim["schedule"]
                         recompute_cog_locks(st.session_state.schedule)
-
-                        gcal_svc = st.session_state.gcal_service
-                        if gcal_svc and sim["tasks_by_date"]:
-                            cal_id = st.session_state.get("calendar_id", "primary")
-                            with st.spinner("📅 寫入 Google Calendar..."):
-                                results = write_to_gcal(gcal_svc, sim["tasks_by_date"], cal_id)
-                            with st.expander("📅 Calendar 寫入結果"):
-                                for r in results: st.markdown(r)
-                        elif not gcal_svc:
-                            st.info("💡 連接 Google Calendar 可自動同步排程。")
+                        # ICS 自動更新（下次點下載時就是最新版）
 
                 st.session_state.messages.append({"role": "assistant", "content": reply})
 
