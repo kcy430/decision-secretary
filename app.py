@@ -24,61 +24,63 @@ st.markdown("""
     header[data-testid="stHeader"] { background-color: #1e1e1e; }
     [data-testid="stAppViewContainer"] { background-color: #1e1e1e; }
 
-    /* ── 月曆格子按鈕 ── */
-    div[data-testid="stColumn"] > div > div > div > div[data-testid="stButton"] > button {
+    /* ── 月曆格子：key 以 cal_ 開頭的按鈕 ── */
+    button[kind="secondary"][data-testid="baseButton-secondary"] {
         width: 100% !important;
-        min-height: 80px !important;
+    }
+    [data-testid="stButton"]:has(button[key^="cal_"]) button,
+    .cal-btn button {
+        width: 100% !important;
+        min-height: 82px !important;
         text-align: left !important;
-        vertical-align: top !important;
         align-items: flex-start !important;
-        padding: 6px 8px !important;
+        justify-content: flex-start !important;
+        padding: 7px 9px !important;
         background-color: #2a2a2a !important;
         border: 1px solid #363636 !important;
         border-radius: 8px !important;
-        color: #bbb !important;
-        font-size: 0.78em !important;
+        color: #ccc !important;
+        font-size: 0.80em !important;
         white-space: pre-wrap !important;
-        line-height: 1.5 !important;
+        line-height: 1.55 !important;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
         transition: border-color .15s, background .15s !important;
     }
-    div[data-testid="stColumn"] > div > div > div > div[data-testid="stButton"] > button:hover {
+    .cal-btn button:hover {
         border-color: #4dabf7 !important;
-        background-color: #2d3748 !important;
-        color: #e0e0e0 !important;
+        background-color: #263040 !important;
+        color: #e8e8e8 !important;
     }
-    /* 今天 */
-    .today-cell button {
-        border-color: #4dabf7 !important;
+    .cal-today button {
+        border: 1.5px solid #4dabf7 !important;
         color: #93c5fd !important;
     }
-    /* 週末 */
-    .weekend-cell button {
-        background-color: #252525 !important;
+    .cal-weekend button {
+        background-color: #242424 !important;
     }
-    /* 認知鎖定 */
-    .cog-lock-cell button {
-        border-color: #ff6b6b !important;
-        background-color: #2e2020 !important;
+    .cal-coglock button {
+        border: 1.5px solid #ff6b6b !important;
+        background-color: #2e1f1f !important;
     }
-    /* 備料等待 */
-    .hw-wait-cell button {
+    .cal-hwwait button {
         border: 1.5px dashed #ffa94d !important;
-        background-color: #2c2618 !important;
+        background-color: #2b2215 !important;
     }
-    /* 空格子佔位 */
+    /* 空格子 */
     .cal-empty {
-        min-height: 80px;
+        min-height: 82px;
         border-radius: 8px;
-        background: transparent;
+        background: #1a1a1a;
+        border: 1px solid #2a2a2a;
     }
     /* 週標題 */
     .cal-header {
         text-align: center;
         font-size: 0.72em;
         font-weight: 600;
-        color: #666;
-        padding: 4px 0 6px;
-        letter-spacing: 0.05em;
+        color: #555;
+        padding: 2px 0 8px;
+        letter-spacing: 0.06em;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -332,10 +334,10 @@ def build_day_label(day_num: int, ds: str, is_today: bool) -> str:
 
 def get_cell_class(ds: str, is_today: bool, is_weekend: bool) -> str:
     day_data = st.session_state.schedule.get(ds, {})
-    if day_data.get("cog_locked"):   return "cog-lock-cell"
-    if day_data.get("hw_wait"):      return "hw-wait-cell"
-    if is_today:                     return "today-cell"
-    if is_weekend:                   return "weekend-cell"
+    if day_data.get("cog_locked"):   return "cal-coglock"
+    if day_data.get("hw_wait"):      return "cal-hwwait"
+    if is_today:                     return "cal-today"
+    if is_weekend:                   return "cal-weekend"
     return ""
 
 def render_calendar(year: int, month: int):
@@ -372,9 +374,8 @@ def render_calendar(year: int, month: int):
                     cell_cls   = get_cell_class(ds, is_today, is_weekend)
                     label      = build_day_label(day_num, ds, is_today)
 
-                    # 注入 class 到下一個按鈕（Streamlit 無法直接給 button 加 class，
-                    # 改用包裹 div 的方式）
-                    st.markdown(f"<div class='{cell_cls}'>", unsafe_allow_html=True)
+                    # 包裹 div 給格子加對應的 class
+                    st.markdown(f"<div class='cal-btn {cell_cls}'>", unsafe_allow_html=True)
                     if st.button(label, key=f"cal_{ds}", use_container_width=True):
                         st.session_state.edit_date = ds
                         st.rerun()
