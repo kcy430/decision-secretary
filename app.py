@@ -30,7 +30,8 @@ st.set_page_config(layout="wide", page_title="決策小秘書 V4.5", page_icon="
 st.markdown("""
 <style>
     section[data-testid="stSidebar"] { background-color: #252525; }
-    .block-container { padding-top: 1.5rem; }
+    .block-container { padding-top: 3.5rem !important; padding-bottom: 1rem; }
+    [data-testid="stAppViewContainer"] { background-color: #1e1e1e; }
     header[data-testid="stHeader"] { background-color: #1e1e1e; }
 </style>
 """, unsafe_allow_html=True)
@@ -544,20 +545,17 @@ with st.sidebar:
     st.header("👤 我的角色設定")
     c1, c2 = st.columns(2)
     with c1:
-        role = st.selectbox("比賽角色", ["組員", "隊長"],
-                            index=["組員","隊長"].index(st.session_state.my_role))
-        st.session_state.my_role = role
+        st.selectbox("比賽角色", ["組員", "隊長"], key="my_role")
     with c2:
         st.number_input("隊伍人數", min_value=1, max_value=10, key="team_size")
 
-    domains = st.multiselect(
+    st.multiselect(
         "我負責的技術領域",
         ["韌體", "電控", "機械", "AI", "軟體", "電路", "硬體"],
-        default=st.session_state.my_domains,
+        key="my_domains",
         help="決定哪些任務會排進你的行事曆",
     )
-    st.session_state.my_domains = domains
-    if role == "隊長":
+    if st.session_state.my_role == "隊長":
         st.caption("隊長自動負責：企劃書、系統整合，以及你選擇的領域。")
 
     st.divider()
@@ -655,12 +653,14 @@ with col_cal:
 with col_chat:
     st.header("🧠 智慧推論大腦")
 
-    uploaded_file = st.file_uploader(
-        "📂 上傳簡章（PDF / PNG / JPG）",
-        type=["pdf", "png", "jpg", "jpeg"]
-    )
+    with st.expander("📂 上傳簡章（PDF / PNG / JPG）", expanded=False):
+        uploaded_file = st.file_uploader(
+            "拖曳或選擇檔案",
+            type=["pdf", "png", "jpg", "jpeg"],
+            label_visibility="collapsed",
+        )
 
-    chat_box = st.container(height=380)
+    chat_box = st.container(height=300)
     with chat_box:
         for msg in st.session_state.messages:
             with st.chat_message(msg["role"]):
