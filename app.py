@@ -403,6 +403,7 @@ class SecretaryBrain:
                             "type": "OBJECT",
                             "properties": {
                                 "name":               {"type":"STRING","description":"子任務名稱"},
+                                "target_date":        {"type":"STRING","description":"若使用者明確指定日期（如4/8、下週三），填 YYYY-MM-DD；無特定日期填空字串"},
                                 "estimated_hours":    {"type":"NUMBER","description":"預估工時（小時），最少 0.5"},
                                 "load":               {"type":"STRING","description":"high=需高度專注或體力；low=輕鬆瑣碎"},
                                 "is_mine":            {"type":"BOOLEAN","description":"根據使用者角色判斷，是否由本人負責"},
@@ -410,7 +411,7 @@ class SecretaryBrain:
                                 "hardware_lead_days": {"type":"INTEGER","description":"若 is_hardware=true，備料等待天數，否則填 0"},
                                 "notes":              {"type":"STRING","description":"補充提醒，可空白"}
                             },
-                            "required":["name","estimated_hours","load","is_mine","is_hardware","hardware_lead_days"]
+                            "required":["name","target_date","estimated_hours","load","is_mine","is_hardware","hardware_lead_days"]
                         }
                     }
                 },
@@ -418,10 +419,16 @@ class SecretaryBrain:
             },
         )
         model  = genai.GenerativeModel("gemini-2.5-flash")
+        import datetime as _dt_mod
+        _today_str = _dt_mod.datetime.now().strftime("%Y-%m-%d")
         system = (
             "你是萬用個人排程助理，可處理任何類型的輸入：比賽專案、日常瑣事、"
             "作業報告、購物清單、會議準備、健身計畫等，全部都要能拆解排程。\n"
-            f"{role_ctx}\n"
+            f"今天日期：{_today_str}。{role_ctx}\n"
+            "【重要】target_date 欄位：若使用者明確提到特定日期（例如 4/8、明天、下週三、4月9日），"
+            "必須將其轉換成 YYYY-MM-DD 格式填入 target_date。"
+            "有了 target_date，系統才能把任務釘在正確的日期，而不是亂填到其他天。"
+            "沒有指定日期的任務才填空字串。\n"
             "is_mine = 此子任務是否應排進使用者自己的行事曆。"
             "若使用者獨自完成或未提及分工，所有任務 is_mine 都填 true。"
         )
@@ -469,6 +476,7 @@ class SecretaryBrain:
         my_tasks    = [t for t in parsed_tasks if t.get("is_mine", True)]
         other_tasks = [t for t in parsed_tasks if not t.get("is_mine", True)]
 
+        # ── 硬體備料標記 ──────────────────────────────────────
         hw_warnings = []
         for t in my_tasks:
             if t.get("is_hardware") and t.get("hardware_lead_days", 0) > 0:
@@ -479,23 +487,48 @@ class SecretaryBrain:
                     if sch[ds]["hw_wait"] is None: sch[ds]["hw_wait"]=f"備料：{t['name']}"
                 hw_warnings.append(f"⏳ **{t['name']}** 需備料約 {t['hardware_lead_days']} 天，前 {lead} 天標記等待期。")
 
-        task_queue = []
-        real_hours  = sum(t.get("estimated_hours", 1) for t in my_tasks)
-        for t in my_tasks:
-            slots = max(1, math.ceil(t.get("estimated_hours", 1)))
-            task_queue.extend([{
-                "id":str(uuid.uuid4())[:8],"name":t["name"],
-                "load":t.get("load","high"),"mine":True,
-                "deadline":None,"notes":t.get("notes","")
-            }] * slots)
-
+        real_hours    = sum(t.get("estimated_hours", 1) for t in my_tasks)
         tasks_by_date = {}
-        remaining = list(task_queue)
+        floating      = []   # 沒有 target_date 的任務，走「從死線往前填」
+
+        # ── 有指定日期的任務：直接釘到那天 ─────────────────────
+        for t in my_tasks:
+            td = (t.get("target_date") or "").strip()
+            task_entry = {
+                "id":   str(uuid.uuid4())[:8],
+                "name": t["name"],
+                "load": t.get("load", "high"),
+                "mine": True,
+                "deadline": None,
+                "notes": t.get("notes", ""),
+            }
+            if td:
+                # 驗證格式，避免 Gemini 填了奇怪的字串
+                try:
+                    datetime.strptime(td, "%Y-%m-%d")
+                    valid_date = True
+                except ValueError:
+                    valid_date = False
+
+                if valid_date:
+                    if td not in sch:
+                        sch[td] = {"tasks":[], "hw_wait":None, "cog_locked":False}
+                    # 有 target_date 的任務，忽略 DAILY_CAP 強制釘入
+                    # （課表、考試、會議等固定事件必須在那天）
+                    sch[td]["tasks"].append(task_entry)
+                    tasks_by_date.setdefault(td, []).append(t["name"])
+                    continue
+            # 沒有 target_date 或格式錯誤 → 進浮動佇列
+            slots = max(1, math.ceil(t.get("estimated_hours", 1)))
+            floating.extend([task_entry] * slots)
+
+        # ── 沒有指定日期的任務：從死線往前填 ───────────────────
+        remaining = list(floating)
         for i in range(deadline-1, -1, -1):
             if not remaining: break
             ds = (today+timedelta(days=i)).strftime("%Y-%m-%d")
             if ds not in sch: sch[ds]={"tasks":[],"hw_wait":None,"cog_locked":False}
-            avail = DAILY_CAP-len(sch[ds]["tasks"])
+            avail = DAILY_CAP - len(sch[ds]["tasks"])
             if avail <= 0: continue
             placed, new_rem = 0, []
             for task in remaining:
@@ -507,19 +540,18 @@ class SecretaryBrain:
             remaining = new_rem
 
         recompute_cog_locks(sch)
-        # 只回報「有實際任務」的認知鎖定天，避免空天假警報
+
+        # 只回報「新排入且有任務」天的認知鎖定，避免空天假警報
+        newly_filled = set(tasks_by_date.keys())
         cog_lock_dates = [
-            (today+timedelta(days=i)).strftime("%Y-%m-%d")
-            for i in range(deadline)
-            if (
-                sch.get((today+timedelta(days=i)).strftime("%Y-%m-%d"),{}).get("cog_locked")
-                and sch.get((today+timedelta(days=i)).strftime("%Y-%m-%d"),{}).get("tasks")
-            )
+            ds for ds in newly_filled
+            if sch.get(ds, {}).get("cog_locked")
         ]
+
         return {
-            "schedule":sch,"weighted_hours":real_hours,"tasks_by_date":tasks_by_date,
-            "overflow":bool(remaining),"hw_warnings":hw_warnings,"cog_lock_dates":cog_lock_dates,
-            "my_tasks":my_tasks,"other_tasks":other_tasks,
+            "schedule":sch, "weighted_hours":real_hours, "tasks_by_date":tasks_by_date,
+            "overflow":bool(remaining), "hw_warnings":hw_warnings, "cog_lock_dates":cog_lock_dates,
+            "my_tasks":my_tasks, "other_tasks":other_tasks,
         }
 
     @staticmethod
