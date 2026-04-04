@@ -399,7 +399,7 @@ def render_calendar(year: int, month: int):
 class SecretaryBrain:
 
     @staticmethod
-    def loop_1_parse(user_input, uploaded_file=None):
+    def loop_1_parse(user_input, uploaded_files=None):
         generation_config = genai.GenerationConfig(
             response_mime_type="application/json",
             response_schema={
@@ -417,17 +417,24 @@ class SecretaryBrain:
         )
         model     = genai.GenerativeModel("gemini-2.5-flash")
         parts     = [f"請分析以下專案需求或比賽簡章：\n{user_input}"]
-        temp_path = None
+        temp_paths = []
 
-        if uploaded_file:
-            ext = "." + uploaded_file.name.split(".")[-1]
-            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
-                f.write(uploaded_file.getvalue()); temp_path = f.name
-            try:
-                parts.append(genai.upload_file(temp_path))
-            except Exception as e:
-                if temp_path and os.path.exists(temp_path): os.remove(temp_path)
-                return {"status":"error","reply":f"⚠️ 檔案上傳失敗：`{e}`"}
+        temp_paths = []
+        if uploaded_files:
+            # 統一轉成 list，支援單檔或多檔
+            files = uploaded_files if isinstance(uploaded_files, list) else [uploaded_files]
+            for uf in files:
+                ext = "." + uf.name.split(".")[-1]
+                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
+                    f.write(uf.getvalue()); tp = f.name
+                temp_paths.append(tp)
+                try:
+                    parts.append(genai.upload_file(tp))
+                    parts.append(f"（以上為檔案：{uf.name}）")
+                except Exception as e:
+                    for p in temp_paths:
+                        if os.path.exists(p): os.remove(p)
+                    return {"status":"error","reply":f"⚠️ 檔案「{uf.name}」上傳失敗：`{e}`"}
 
         try:
             resp = model.generate_content(parts, generation_config=generation_config)
@@ -436,7 +443,8 @@ class SecretaryBrain:
             data = {"confidence":"low","follow_up_question":f"API 錯誤：`{e}`",
                     "tech_tags":[],"deadline_days":14,"project_name":"未命名專案"}
         finally:
-            if temp_path and os.path.exists(temp_path): os.remove(temp_path)
+            for p in temp_paths:
+                if os.path.exists(p): os.remove(p)
 
         if data.get("confidence") == "low" or not data.get("tech_tags"):
             return {"status":"needs_info",
@@ -630,9 +638,11 @@ with col_cal:
 with col_chat:
     st.header("🧠 智慧推論大腦")
 
-    with st.expander("📂 上傳簡章（PDF / PNG / JPG）", expanded=False):
-        uploaded_file = st.file_uploader(
-            "拖曳或選擇檔案", type=["pdf","png","jpg","jpeg"],
+    with st.expander("📂 上傳簡章（PDF / PNG / JPG，可多選）", expanded=False):
+        uploaded_files = st.file_uploader(
+            "拖曳或選擇檔案（可同時選多個）",
+            type=["pdf","png","jpg","jpeg"],
+            accept_multiple_files=True,
             label_visibility="collapsed")
 
     chat_box = st.container(height=300)
@@ -650,7 +660,7 @@ with col_chat:
             with st.chat_message("user"): st.markdown(prompt)
             with st.chat_message("assistant"):
                 with st.spinner("🔍 大腦解析中..."):
-                    parsed = SecretaryBrain.loop_1_parse(prompt, uploaded_file)
+                    parsed = SecretaryBrain.loop_1_parse(prompt, uploaded_files if uploaded_files else None)
 
                 if parsed["status"] != "success":
                     reply = parsed["reply"]
