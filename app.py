@@ -94,16 +94,7 @@ GCAL_SCOPES    = ["https://www.googleapis.com/auth/calendar.events"]
 LOAD_OPTIONS   = {"🔴 高負載": "high", "🟢 低負載": "low"}
 LOAD_DISPLAY   = {v: k for k, v in LOAD_OPTIONS.items()}
 
-RAG_DB = {
-    "機構設計與3D列印":  {"base_hours": 20, "diff": 3, "load": "high", "hardware": True,  "lead_days": 7,  "roles": ["機械","隊長","所有人"]},
-    "馬達控制演算法":    {"base_hours": 35, "diff": 5, "load": "high", "hardware": False, "lead_days": 0,  "roles": ["韌體","電控"]},
-    "影像辨識模組":      {"base_hours": 40, "diff": 4, "load": "high", "hardware": False, "lead_days": 0,  "roles": ["AI","軟體"]},
-    "企劃書與簡報撰寫":  {"base_hours": 15, "diff": 2, "load": "low",  "hardware": False, "lead_days": 0,  "roles": ["隊長","所有人"]},
-    "PCB電路設計":       {"base_hours": 25, "diff": 4, "load": "high", "hardware": True,  "lead_days": 14, "roles": ["電路","硬體"]},
-    "感測器整合":        {"base_hours": 20, "diff": 3, "load": "high", "hardware": True,  "lead_days": 10, "roles": ["韌體","電控","所有人"]},
-    "系統整合與測試":    {"base_hours": 15, "diff": 3, "load": "high", "hardware": False, "lead_days": 0,  "roles": ["隊長","所有人"]},
-}
-TECH_TAGS = list(RAG_DB.keys())
+# RAG_DB 已移除，改由 Gemini 自由推論任意任務的工時與負載
 
 # ══════════════════════════════════════════════════════════════
 #  SESSION STATE
@@ -160,16 +151,6 @@ def recompute_cog_locks(schedule: dict) -> dict:
         schedule[ds]["cog_locked"] = all(l == "high" for l in prev)
     return schedule
 
-def filter_my_tasks(all_techs, my_role, my_domains):
-    mine = []
-    for tech in all_techs:
-        meta = RAG_DB.get(tech)
-        if not meta: continue
-        roles = meta["roles"]
-        if "所有人" in roles: mine.append(tech)
-        elif my_role == "隊長" and "隊長" in roles: mine.append(tech)
-        elif any(d in roles for d in my_domains): mine.append(tech)
-    return mine
 
 # ══════════════════════════════════════════════════════════════
 #  ICS EXPORT
@@ -400,28 +381,54 @@ class SecretaryBrain:
 
     @staticmethod
     def loop_1_parse(user_input, uploaded_files=None):
+        """萬用模式：Gemini 自由估算任意輸入的子任務、工時、負載。"""
+        role_ctx = (
+            f"使用者角色：{st.session_state.my_role}，"
+            f"負責領域：{', '.join(st.session_state.my_domains) or '未指定'}，"
+            f"隊伍人數：{st.session_state.team_size} 人。"
+        )
         generation_config = genai.GenerationConfig(
             response_mime_type="application/json",
             response_schema={
                 "type": "OBJECT",
                 "properties": {
-                    "tech_tags":          {"type":"ARRAY","items":{"type":"STRING"},
-                                           "description":f"只能從：{TECH_TAGS}"},
-                    "confidence":         {"type":"STRING","description":"高填 high，不足填 low"},
-                    "follow_up_question": {"type":"STRING","description":"low 時詢問缺少資訊"},
-                    "deadline_days":      {"type":"INTEGER","description":"距死線天數，未提及填 14"},
-                    "project_name":       {"type":"STRING","description":"專案名稱，找不到填「未命名專案」"},
+                    "project_name":       {"type":"STRING","description":"事項名稱，找不到填「未命名事項」"},
+                    "deadline_days":      {"type":"INTEGER","description":"距截止日天數，未提及填 14"},
+                    "confidence":         {"type":"STRING","description":"可以排程填 high；完全無法判斷填 low"},
+                    "follow_up_question": {"type":"STRING","description":"confidence 為 low 時詢問缺少的資訊"},
+                    "tasks": {
+                        "type": "ARRAY",
+                        "description": "拆解出的子任務，任何類型皆可（比賽、瑣事、作業、購物…）",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "name":               {"type":"STRING","description":"子任務名稱"},
+                                "estimated_hours":    {"type":"NUMBER","description":"預估工時（小時），最少 0.5"},
+                                "load":               {"type":"STRING","description":"high=需高度專注或體力；low=輕鬆瑣碎"},
+                                "is_mine":            {"type":"BOOLEAN","description":"根據使用者角色判斷，是否由本人負責"},
+                                "is_hardware":        {"type":"BOOLEAN","description":"是否需要購買或等待實體零件材料"},
+                                "hardware_lead_days": {"type":"INTEGER","description":"若 is_hardware=true，備料等待天數，否則填 0"},
+                                "notes":              {"type":"STRING","description":"補充提醒，可空白"}
+                            },
+                            "required":["name","estimated_hours","load","is_mine","is_hardware","hardware_lead_days"]
+                        }
+                    }
                 },
-                "required":["tech_tags","confidence","follow_up_question","deadline_days","project_name"],
+                "required":["project_name","deadline_days","confidence","follow_up_question","tasks"]
             },
         )
-        model     = genai.GenerativeModel("gemini-2.5-flash")
-        parts     = [f"請分析以下專案需求或比賽簡章：\n{user_input}"]
+        model  = genai.GenerativeModel("gemini-2.5-flash")
+        system = (
+            "你是萬用個人排程助理，可處理任何類型的輸入：比賽專案、日常瑣事、"
+            "作業報告、購物清單、會議準備、健身計畫等，全部都要能拆解排程。\n"
+            f"{role_ctx}\n"
+            "is_mine = 此子任務是否應排進使用者自己的行事曆。"
+            "若使用者獨自完成或未提及分工，所有任務 is_mine 都填 true。"
+        )
+        parts      = [system, f"\n使用者輸入：{user_input}"]
         temp_paths = []
 
-        temp_paths = []
         if uploaded_files:
-            # 統一轉成 list，支援單檔或多檔
             files = uploaded_files if isinstance(uploaded_files, list) else [uploaded_files]
             for uf in files:
                 ext = "." + uf.name.split(".")[-1]
@@ -441,45 +448,47 @@ class SecretaryBrain:
             data = json.loads(resp.text)
         except Exception as e:
             data = {"confidence":"low","follow_up_question":f"API 錯誤：`{e}`",
-                    "tech_tags":[],"deadline_days":14,"project_name":"未命名專案"}
+                    "tasks":[],"deadline_days":14,"project_name":"未命名事項"}
         finally:
             for p in temp_paths:
                 if os.path.exists(p): os.remove(p)
 
-        if data.get("confidence") == "low" or not data.get("tech_tags"):
+        if data.get("confidence") == "low" or not data.get("tasks"):
             return {"status":"needs_info",
-                    "reply":f"🛑 **資訊不足。**\n\n{data.get('follow_up_question')}"}
-        return {"status":"success",**data}
+                    "reply":"🛑 **資訊不足，請補充：**\n\n" + str(data.get("follow_up_question",""))}
+        return {"status":"success", **data}
 
     @staticmethod
-    def sandbox(my_techs, current_schedule, deadline_days):
+    def sandbox(parsed_tasks, current_schedule, deadline_days):
         today    = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         deadline = min(deadline_days, 120)
         sch = {ds:{"tasks":list(v["tasks"]),"hw_wait":v["hw_wait"],"cog_locked":v["cog_locked"]}
                for ds,v in current_schedule.items()}
         recompute_cog_locks(sch)
 
+        my_tasks    = [t for t in parsed_tasks if t.get("is_mine", True)]
+        other_tasks = [t for t in parsed_tasks if not t.get("is_mine", True)]
+
         hw_warnings = []
-        for tech in my_techs:
-            meta = RAG_DB.get(tech,{})
-            if meta.get("hardware") and meta.get("lead_days",0) > 0:
-                lead = min(meta["lead_days"], deadline-1)
+        for t in my_tasks:
+            if t.get("is_hardware") and t.get("hardware_lead_days", 0) > 0:
+                lead = min(t["hardware_lead_days"], deadline - 1)
                 for i in range(lead):
                     ds = (today+timedelta(days=i)).strftime("%Y-%m-%d")
                     if ds not in sch: sch[ds]={"tasks":[],"hw_wait":None,"cog_locked":False}
-                    if sch[ds]["hw_wait"] is None: sch[ds]["hw_wait"]=f"備料：{tech}"
-                hw_warnings.append(f"⏳ **{tech}** 需備料 {meta['lead_days']} 天，前 {lead} 天標記等待期。")
-
-        total_hours = sum(RAG_DB[t]["base_hours"] for t in my_techs if t in RAG_DB)
-        max_diff    = max((RAG_DB[t]["diff"] for t in my_techs if t in RAG_DB), default=1)
-        weighted    = math.ceil(total_hours*(1+(max_diff-1)*0.25))
+                    if sch[ds]["hw_wait"] is None: sch[ds]["hw_wait"]=f"備料：{t['name']}"
+                hw_warnings.append(f"⏳ **{t['name']}** 需備料約 {t['hardware_lead_days']} 天，前 {lead} 天標記等待期。")
 
         task_queue = []
-        for tech in my_techs:
-            meta = RAG_DB.get(tech,{})
-            w    = math.ceil(meta.get("base_hours",4)*(1+(meta.get("diff",1)-1)*0.25))
-            task_queue.extend([{"id":str(uuid.uuid4())[:8],"name":tech,
-                "load":meta.get("load","high"),"mine":True,"deadline":None,"notes":""}]*w)
+        total_hours = 0
+        for t in my_tasks:
+            slots = max(1, math.ceil(t.get("estimated_hours", 1)))
+            total_hours += slots
+            task_queue.extend([{
+                "id":str(uuid.uuid4())[:8],"name":t["name"],
+                "load":t.get("load","high"),"mine":True,
+                "deadline":None,"notes":t.get("notes","")
+            }] * slots)
 
         tasks_by_date = {}
         remaining = list(task_queue)
@@ -504,47 +513,53 @@ class SecretaryBrain:
             for i in range(deadline)
             if sch.get((today+timedelta(days=i)).strftime("%Y-%m-%d"),{}).get("cog_locked")
         ]
-        return {"schedule":sch,"weighted_hours":weighted,"tasks_by_date":tasks_by_date,
-                "overflow":bool(remaining),"hw_warnings":hw_warnings,"cog_lock_dates":cog_lock_dates}
+        return {
+            "schedule":sch,"weighted_hours":total_hours,"tasks_by_date":tasks_by_date,
+            "overflow":bool(remaining),"hw_warnings":hw_warnings,"cog_lock_dates":cog_lock_dates,
+            "my_tasks":my_tasks,"other_tasks":other_tasks,
+        }
 
     @staticmethod
-    def loop_2_strategy(parse_data, my_techs, sandbox_res):
-        project   = parse_data.get("project_name","此專案")
-        all_techs = parse_data["tech_tags"]
-        not_mine  = [t for t in all_techs if t not in my_techs]
-        w         = sandbox_res["weighted_hours"]
-        deadline  = parse_data["deadline_days"]
+    def loop_2_strategy(parse_data, sandbox_res):
+        project     = parse_data.get("project_name","此事項")
+        my_tasks    = sandbox_res["my_tasks"]
+        other_tasks = sandbox_res["other_tasks"]
+        w           = sandbox_res["weighted_hours"]
+        deadline    = parse_data["deadline_days"]
 
-        lines = [
-            f"### 📋 {project}",
-            f"**全專案技術棧**：{', '.join(all_techs)}",
-            f"**你的負責項目**（{len(my_techs)} 項）：{', '.join(my_techs) if my_techs else '⚠️ 無匹配，請更新左側角色設定'}",
-        ]
-        if not_mine: lines.append(f"**隊友負責**（{len(not_mine)} 項）：{', '.join(not_mine)}")
+        lines = [f"### 📋 {project}"]
+        if my_tasks:
+            lines.append("**你的任務：**")
+            for t in my_tasks:
+                h    = t.get("estimated_hours", 1)
+                load = "🔴 高負載" if t.get("load") == "high" else "🟢 低負載"
+                hw   = f"（需備料 {t['hardware_lead_days']} 天）" if t.get("is_hardware") else ""
+                note = f"　_{t['notes']}_" if t.get("notes") else ""
+                lines.append(f"- **{t['name']}**　{h}h　{load}{hw}{note}")
+        if other_tasks:
+            lines.append("\n**隊友 / 他人負責：**")
+            for t in other_tasks:
+                lines.append(f"- {t['name']}　{t.get('estimated_hours',1)}h")
+
+        lines.append(f"\n**你的總工時估算：{w} 小時**　／　距截止 {deadline} 天")
         lines.append("---")
-
-        if not my_techs:
-            lines.append("你的角色與這場比賽的技術棧沒有交集，請在左側更新「我的領域」。")
-            return "\n".join(lines)
-
         for m in sandbox_res["hw_warnings"]: lines.append(m)
         if sandbox_res["cog_lock_dates"]:
             sample = ", ".join(sandbox_res["cog_lock_dates"][:3])
             lines.append(f"🧠 **認知負載警告**：已鎖定 {sample} 等日期高負載名額。")
 
         lines.append("")
-        max_daily = DAILY_CAP*deadline
-        load_pct  = int(w/max_daily*100) if max_daily > 0 else 999
+        max_daily = DAILY_CAP * deadline
+        load_pct  = int(w / max_daily * 100) if max_daily > 0 else 999
 
         if sandbox_res["overflow"]:
-            lines.append(f"### 🔴 無法接案\n加權工時 **{w} 小時**，死線前物理時間已擊穿。\n建議：延後死線 / 縮減功能 / 增加人手。")
+            lines.append("### 🔴 時間不夠\n死線前物理時間已擊穿。\n建議：延後截止日 / 縮減範圍 / 請人協助。")
         elif load_pct >= 80:
-            lines.append(f"### 🟡 勉強可接（中等風險）\n加權工時 **{w} 小時**，行事曆負載達 {load_pct}%，已排入。\n建議：本週末先完成環境架設，把風險前壓。")
+            lines.append(f"### 🟡 勉強可行（中等風險）\n行事曆負載達 {load_pct}%，已排入。建議盡早開始高風險項目。")
         else:
-            lines.append(f"### 🟢 適合接案\n加權工時 **{w} 小時**，行事曆負載 {load_pct}%，餘裕充足，已自動排入。")
+            lines.append(f"### 🟢 可以接\n行事曆負載 {load_pct}%，餘裕充足，已自動排入。")
 
         return "\n".join(lines)
-
 
 # ══════════════════════════════════════════════════════════════
 #  SIDEBAR
@@ -666,11 +681,10 @@ with col_chat:
                     reply = parsed["reply"]
                     st.markdown(reply)
                 else:
-                    my_techs = filter_my_tasks(
-                        parsed["tech_tags"], st.session_state.my_role, st.session_state.my_domains)
                     with st.spinner("⚙️ 沙盒模擬排程中..."):
-                        sim = SecretaryBrain.sandbox(my_techs, st.session_state.schedule, parsed["deadline_days"])
-                    reply = SecretaryBrain.loop_2_strategy(parsed, my_techs, sim)
+                        sim = SecretaryBrain.sandbox(
+                            parsed["tasks"], st.session_state.schedule, parsed["deadline_days"])
+                    reply = SecretaryBrain.loop_2_strategy(parsed, sim)
                     st.markdown(reply)
 
                     if not sim["overflow"] and my_techs:
