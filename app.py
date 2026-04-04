@@ -480,10 +480,9 @@ class SecretaryBrain:
                 hw_warnings.append(f"⏳ **{t['name']}** 需備料約 {t['hardware_lead_days']} 天，前 {lead} 天標記等待期。")
 
         task_queue = []
-        total_hours = 0
+        real_hours  = sum(t.get("estimated_hours", 1) for t in my_tasks)
         for t in my_tasks:
             slots = max(1, math.ceil(t.get("estimated_hours", 1)))
-            total_hours += slots
             task_queue.extend([{
                 "id":str(uuid.uuid4())[:8],"name":t["name"],
                 "load":t.get("load","high"),"mine":True,
@@ -508,13 +507,17 @@ class SecretaryBrain:
             remaining = new_rem
 
         recompute_cog_locks(sch)
+        # 只回報「有實際任務」的認知鎖定天，避免空天假警報
         cog_lock_dates = [
             (today+timedelta(days=i)).strftime("%Y-%m-%d")
             for i in range(deadline)
-            if sch.get((today+timedelta(days=i)).strftime("%Y-%m-%d"),{}).get("cog_locked")
+            if (
+                sch.get((today+timedelta(days=i)).strftime("%Y-%m-%d"),{}).get("cog_locked")
+                and sch.get((today+timedelta(days=i)).strftime("%Y-%m-%d"),{}).get("tasks")
+            )
         ]
         return {
-            "schedule":sch,"weighted_hours":total_hours,"tasks_by_date":tasks_by_date,
+            "schedule":sch,"weighted_hours":real_hours,"tasks_by_date":tasks_by_date,
             "overflow":bool(remaining),"hw_warnings":hw_warnings,"cog_lock_dates":cog_lock_dates,
             "my_tasks":my_tasks,"other_tasks":other_tasks,
         }
@@ -626,8 +629,9 @@ if st.session_state.edit_date:
 # ══════════════════════════════════════════════════════════════
 col_cal, col_chat = st.columns([7, 3])
 
-# ── 月曆 ──────────────────────────────────────────────────────
-with col_cal:
+# ── 月曆（@st.fragment 讓翻頁不影響聊天）─────────────────────
+@st.fragment
+def calendar_section():
     yr = st.session_state.cal_year
     mo = st.session_state.cal_month
 
@@ -636,7 +640,7 @@ with col_cal:
         if st.button("◀", use_container_width=True, help="上個月"):
             if mo == 1: st.session_state.cal_year -= 1; st.session_state.cal_month = 12
             else:       st.session_state.cal_month -= 1
-            st.rerun()
+            st.rerun(scope="fragment")
     with nav_title:
         st.markdown(
             f"<h3 style='text-align:center;margin:0;padding:4px 0'>🗓️ {yr} 年 {mo} 月</h3>",
@@ -645,9 +649,12 @@ with col_cal:
         if st.button("▶", use_container_width=True, help="下個月"):
             if mo == 12: st.session_state.cal_year += 1; st.session_state.cal_month = 1
             else:        st.session_state.cal_month += 1
-            st.rerun()
+            st.rerun(scope="fragment")
 
     render_calendar(yr, mo)
+
+with col_cal:
+    calendar_section()
 
 # ── 聊天 ──────────────────────────────────────────────────────
 with col_chat:
@@ -687,7 +694,7 @@ with col_chat:
                     reply = SecretaryBrain.loop_2_strategy(parsed, sim)
                     st.markdown(reply)
 
-                    if not sim["overflow"] and my_techs:
+                    if not sim["overflow"] and sim["my_tasks"]:
                         st.session_state.schedule = sim["schedule"]
                         recompute_cog_locks(st.session_state.schedule)
 
