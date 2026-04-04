@@ -556,43 +556,68 @@ class SecretaryBrain:
 
     @staticmethod
     def loop_2_strategy(parse_data, sandbox_res):
-        project     = parse_data.get("project_name","此事項")
+        project     = parse_data.get("project_name", "此事項")
         my_tasks    = sandbox_res["my_tasks"]
         other_tasks = sandbox_res["other_tasks"]
-        w           = sandbox_res["weighted_hours"]
         deadline    = parse_data["deadline_days"]
 
+        # 區分固定行程（有 target_date）vs 專案任務（沒有）
+        pinned   = [t for t in my_tasks if (t.get("target_date") or "").strip()]
+        floating = [t for t in my_tasks if not (t.get("target_date") or "").strip()]
+
         lines = [f"### 📋 {project}"]
-        if my_tasks:
-            lines.append("**你的任務：**")
-            for t in my_tasks:
+
+        # ── 固定行程區塊 ─────────────────────────────────────
+        if pinned:
+            lines.append("**📌 已釘入行事曆：**")
+            for t in pinned:
+                td   = t.get("target_date", "")
+                h    = t.get("estimated_hours", 1)
+                load = "🔴 高負載" if t.get("load") == "high" else "🟢 低負載"
+                note = f"　_{t['notes']}_" if t.get("notes") else ""
+                lines.append(f"- **{t['name']}**　{td}　{h}h　{load}{note}")
+
+        # ── 專案任務區塊 ─────────────────────────────────────
+        if floating:
+            lines.append("**🗂 專案任務（依死線自動排入）：**")
+            for t in floating:
                 h    = t.get("estimated_hours", 1)
                 load = "🔴 高負載" if t.get("load") == "high" else "🟢 低負載"
                 hw   = f"（需備料 {t['hardware_lead_days']} 天）" if t.get("is_hardware") else ""
                 note = f"　_{t['notes']}_" if t.get("notes") else ""
                 lines.append(f"- **{t['name']}**　{h}h　{load}{hw}{note}")
+
         if other_tasks:
-            lines.append("\n**隊友 / 他人負責：**")
+            lines.append("**👥 隊友 / 他人負責：**")
             for t in other_tasks:
                 lines.append(f"- {t['name']}　{t.get('estimated_hours',1)}h")
 
-        lines.append(f"\n**你的總工時估算：{w} 小時**　／　距截止 {deadline} 天")
+        lines.append("")
         lines.append("---")
-        for m in sandbox_res["hw_warnings"]: lines.append(m)
+
+        for m in sandbox_res["hw_warnings"]:
+            lines.append(m)
         if sandbox_res["cog_lock_dates"]:
             sample = ", ".join(sandbox_res["cog_lock_dates"][:3])
-            lines.append(f"🧠 **認知負載警告**：已鎖定 {sample} 等日期高負載名額。")
+            lines.append(f"🧠 **認知負載警告**：{sample} 等日期已達高負載上限。")
 
-        lines.append("")
-        max_daily = DAILY_CAP * deadline
-        load_pct  = int(w / max_daily * 100) if max_daily > 0 else 999
+        # ── 只有浮動任務才需要可行性評估 ─────────────────────
+        if floating:
+            float_hours = sum(t.get("estimated_hours", 1) for t in floating)
+            max_daily   = DAILY_CAP * deadline
+            load_pct    = int(float_hours / max_daily * 100) if max_daily > 0 else 999
+            lines.append(f"\n**專案任務總工時：{float_hours:.1f} 小時**　／　距截止 {deadline} 天")
 
-        if sandbox_res["overflow"]:
-            lines.append("### 🔴 時間不夠\n死線前物理時間已擊穿。\n建議：延後截止日 / 縮減範圍 / 請人協助。")
-        elif load_pct >= 80:
-            lines.append(f"### 🟡 勉強可行（中等風險）\n行事曆負載達 {load_pct}%，已排入。建議盡早開始高風險項目。")
-        else:
-            lines.append(f"### 🟢 可以接\n行事曆負載 {load_pct}%，餘裕充足，已自動排入。")
+            if sandbox_res["overflow"]:
+                lines.append("### 🔴 時間不夠\n死線前物理時間已擊穿。\n建議：延後截止日 / 縮減範圍 / 請人協助。")
+            elif load_pct >= 80:
+                lines.append(f"### 🟡 勉強可行（中等風險）\n行事曆負載達 {load_pct}%，已排入。")
+            else:
+                lines.append(f"### 🟢 已排入\n行事曆負載 {load_pct}%，餘裕充足。")
+        elif pinned and not floating:
+            # 純固定行程，不需要可行性評估
+            total_h = sum(t.get("estimated_hours", 1) for t in pinned)
+            lines.append(f"### ✅ 已釘入行事曆\n共 {total_h:.1f} 小時的固定行程，無需可行性評估。")
 
         return "\n".join(lines)
 
